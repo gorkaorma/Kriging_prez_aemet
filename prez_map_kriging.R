@@ -191,8 +191,8 @@ breaks_vals <- seq(0, 300, by = 50)
 # Plotear el resultado del kriging
 p <- ggplot() +
   geom_sf(data = kriging_crop, aes(fill = var1.pred), color = NA, lwd = 0) +
-  geom_sf(data = herrialdeak, fill = NA, color = "black", lwd = 0.05) +
-  geom_sf(data = eh, fill = NA, color = "black", lwd = 0.4) +
+  geom_sf(data = herrialdeak, fill = NA, color = "black", lwd = 0.075) +
+  geom_sf(data = eh, fill = NA, color = "black", lwd = 0.6) +
   scale_fill_gradientn(colors = cols, 
                        breaks = breaks_vals, 
                        limits = c(0, 300), 
@@ -210,12 +210,117 @@ p <- ggplot() +
         plot.title = element_text(hjust = 0.5, size = 24, face = "bold", margin = margin(t = 10, b = 5)),
         plot.subtitle = element_text(hjust = 0.5, size = 14, margin = margin(t = 0, b = 5))
         )
+p
 
 # Guardar el plot
 ggsave(
   filename = "kriging_arrunta.png",           # nombre del archivo
   plot = p,                                   # plot a guardar
   width = 8,                                  # ancho en pulgadas
+  height = 10,                                # alto en pulgadas
+  dpi = 300                                   # resolución (para imprimir/publicar)
+)
+
+################ Cokriging #########################
+library(terra)
+library(gstat)
+library(sf)
+library(sp)
+
+# cargar DEM de Euskal Herria
+dem <- rast("eh_dem.tif")
+ext(dem)
+crs(dem)
+plot(dem)
+
+# Extraer altitud para cada estación de datos de precipitación
+coords <- vect(data_sf)
+data_sf$altitud_dem <- extract(dem, coords)[,2]
+
+# Convertir a SpatialPointsDataFrame para gstat
+data_sp <- as(data_sf, "Spatial")
+
+# Crear el model de cokriging usando la variable de precipitación y la altitud como covariable.
+g <- gstat(NULL, id = "prec", formula = precipitacion_mes ~ 1, data = data_sp)
+g <- gstat(g, id = "alt", formula = altitud_dem ~ 1, data = data_sp)
+
+# Variograma y ajuste
+vg <- variogram(g)
+
+vg_model <- vgm(1, "Sph", 10000, 0.1)
+vg_fit <- fit.lmc(vg, g, model = vg_model)
+
+# Crear grid para predicción
+grid <- as.data.frame(dem, xy = TRUE, na.rm = TRUE)
+names(grid)[3] <- "altitud_dem"
+coordinates(grid) <- ~x+y
+proj4string(grid) <- crs(dem)
+
+# Realizar cokriging
+cokriging_result <- predict(vg_fit, newdata = grid)
+
+# Convertir resultado a raster
+df_co <- as.data.frame(cokriging_result)
+cokriging_raster <- rast(df_co[, c("x", "y", "prec.pred")], type = "xyz")
+crs(cokriging_raster) <- crs(dem)
+plot(cokriging_raster)
+
+crs(cokriging_raster)
+crs(eh)
+
+
+# Mask the cokriging result to the shape of Euskal Herria
+cokriging_crop <- crop(cokriging_raster, eh)
+cokriging_masked <- mask(cokriging_crop, eh)
+
+# Plotear el resultado del cokriging
+plot(cokriging_masked)
+lines(eh, col = "black")
+
+library(tidyverse)
+# Con ggplot
+cokriging_df <- as.data.frame(cokriging_masked, xy = TRUE, na.rm = TRUE) 
+
+p2 <- ggplot() +
+  geom_raster(data = cokriging_df, aes(x = x, y = y, fill = prec.pred)) +
+  geom_sf(data = herrialdeak, fill = NA, color = "black", lwd = 0.075) +
+  geom_sf(data = eh, fill = NA, color = "black", lwd = 0.6) +
+  scale_fill_gradientn(colors = cols, 
+                       breaks = breaks_vals, 
+                       limits = c(0, 300), 
+                       oob = scales::squish,
+                       name = "(mm)") +
+  labs(title = "Prezipitazioa Martxoan", subtitle = "Cokriging") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.key.width = unit(1.5, "cm"),
+        legend.key.height = unit(0.5, "cm"),
+        panel.grid = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 24, face = "bold", margin = margin(t = 10, b = 5)),
+        plot.subtitle = element_text(hjust = 0.5, size = 14, margin = margin(t = 0, b = 5))
+        ) 
+
+p2
+
+# Guardar el plot
+ggsave( 
+  filename = "cokriging_martxoa.png",         # nombre del archivo
+  plot = p2,                                  # plot a guardar
+  width = 8,                                  # ancho en pulgadas
+  height = 10,                                # alto en pulgadas
+  dpi = 300                                   # resolución (para imprimir/publicar)
+)
+
+# Guardar los dos plots juntos
+library(gridExtra)
+combined_plot <- grid.arrange(p, p2, ncol = 2)
+ggsave( 
+  filename = "kriging_cokriging_biak.png",         # nombre del archivo
+  plot = combined_plot,                                  # plot a guardar
+  width = 16,                                  # ancho en pulgadas
   height = 10,                                # alto en pulgadas
   dpi = 300                                   # resolución (para imprimir/publicar)
 )
