@@ -135,19 +135,127 @@ for (estacion in eusk_st$id) {
   )
 }
 
+###################### Iparralde Data ######################
+# Descargar estaciones disponibles
+library(httr)
+library(jsonlite)
+library(dplyr)
+
+url <- "https://www.infoclimat.fr/stations-meteo/getList.php?pays=FR"
+res <- GET(url)
+txt <- content(res, "text", encoding = "UTF-8")
+json <- fromJSON(txt, flatten = TRUE)
+stations_ipa <- json$data
+stations_ipa <- as.data.frame(stations)
+head(stations_ipa)
+
+iparralde <- stations_ipa %>% filter(data.dept == "64")
+
+
+# Try a single station to see how the data is structured
+library(rvest)
+station_id <- iparralde$data.stationid[10]
+station_name <- iparralde$data.name[10]
+url_data <- paste0("https://www.infoclimat.fr/climatologie/annee/2026/", station_name, "/valeurs/", station_id, ".html")
+# Read the HTML content of the page
+res_data <- GET(url_data)
+html_data <- content(res_data, "text", encoding = "UTF-8")
+page <- read_html(html_data)
+
+tables <- html_table(page, fill = TRUE)
+tables[[1]]
+
+# Extraer precipitacion (CumulPrécips) de Marzo (columna mars2026)
+precip_mars <- tables[[1]]$mars2026[14] # La fila 13 o 14 corresponde a CumulPrécips
+
+# Repetir para todas las estaciones de iparralde y obtener sus datos de precipitación de marzo
+iparralde_data <- data.frame()
+
+year <- 2026
+
+for (i in 1:nrow(iparralde)) {
+  station_id <- iparralde$data.stationid[i]
+  station_name <- iparralde$data.name[i]
+  
+  station_name_clean <- URLencode(station_name, reserved = TRUE)
+  
+  url_data <- paste0(
+    "https://www.infoclimat.fr/climatologie/annee/",
+    year, "/",
+    station_name_clean,
+    "/valeurs/",
+    station_id,
+    ".html"
+  )
+  
+  res_data <- GET(url_data)
+  html_data <- content(res_data, "text", encoding = "UTF-8")
+  page <- read_html(html_data)
+  
+  tables <- html_table(page, fill = TRUE)
+  
+  if (length(tables) > 0) {
+    
+    tabla <- tables[[1]]
+    
+    # 🔍 Buscar fila "Cumul"
+    fila_cumul <- which(grepl("Cumul|Total|Somme", tabla[[1]], ignore.case = TRUE))
+    
+    if (length(fila_cumul) > 0) {
+      precip_mars <- tabla[fila_cumul[1], 2]
+      
+      # 🧹 Limpieza
+      precip_mars <- gsub(",", ".", precip_mars)
+      precip_mars <- gsub("[^0-9.]", "", precip_mars)
+      precip_mars <- as.numeric(precip_mars)
+      
+    } else {
+      warning(paste("No se encontró Cumul en", station_name))
+      precip_mars <- NA
+    }
+    
+    iparralde_data <- rbind(
+      iparralde_data,
+      data.frame(
+        estacion = station_name,
+        precipitacion_mes = precip_mars,
+        latitud = iparralde$data.latitude[i],
+        longitud = iparralde$data.longitude[i]
+      )
+    )
+  }
+}
+
+
 ###################### JOIN DATA ######################
 # Cambiar nombre de columna en datos_naf para que coincida con euskalmet_data (izena -> estacion)
 # y renombrar lon y lat a longitud y latitud respectivamente
 datos_naf <- datos_naf %>% rename(izena = estacion) %>%
   rename(longitud = lon, latitud = lat) %>% rename(altitud = ALTITUD)
+
+iparralde_data <- iparralde_data %>% rename(izena = estacion) %>%
+  mutate(
+    latitud = as.numeric(latitud),
+    longitud = as.numeric(longitud),
+    precipitacion_mes = as.numeric(precipitacion_mes)
+  )
+   
   
-# Unir los datos de Euskalmet con los de Navarra
-data <- bind_rows(datos_naf, euskalmet_data) %>%
-  select(izena, altitud, latitud, longitud, precipitacion_mes)
+# Unir los datos de Euskalmet, Meteo Navarra e Iparralde en un solo data frame
+data <- bind_rows(
+  euskalmet_data %>% select(izena, precipitacion_mes, latitud, longitud),
+  datos_naf %>% select(izena, precipitacion_mes, latitud, longitud),
+  iparralde_data %>% select(izena, precipitacion_mes, latitud, longitud)
+ )
+
+# Eliminar filas con datos faltantes
+data <- data %>% filter(!is.na(latitud) & !is.na(longitud) & !is.na(precipitacion_mes))
+
 
 #################### PLOT DATA #####################
 # Plotear las estaciones de datos de precipitación en un mapa de Euskal Herria con el shapefile de Euskal Herria como fondo, usando ggplot2. 
 # El color de los puntos representará la cantidad de precipitación mensual. 
+library(tidyverse)
 
 ggplot() +
   geom_point(data = data, aes(x = longitud, y = latitud, color = precipitacion_mes), size = 3) +
@@ -221,109 +329,6 @@ ggsave(
   dpi = 300                                   # resolución (para imprimir/publicar)
 )
 
-################ Cokriging #########################
-library(terra)
-library(gstat)
-library(sf)
-library(sp)
-
-# cargar DEM de Euskal Herria
-dem <- rast("eh_dem.tif")
-ext(dem)
-crs(dem)
-plot(dem)
-
-# Extraer altitud para cada estación de datos de precipitación
-coords <- vect(data_sf)
-data_sf$altitud_dem <- extract(dem, coords)[,2]
-
-# Convertir a SpatialPointsDataFrame para gstat
-data_sp <- as(data_sf, "Spatial")
-
-# Crear el model de cokriging usando la variable de precipitación y la altitud como covariable.
-g <- gstat(NULL, id = "prec", formula = precipitacion_mes ~ 1, data = data_sp)
-g <- gstat(g, id = "alt", formula = altitud_dem ~ 1, data = data_sp)
-
-# Variograma y ajuste
-vg <- variogram(g)
-
-vg_model <- vgm(1, "Sph", 10000, 0.1)
-vg_fit <- fit.lmc(vg, g, model = vg_model)
-
-# Crear grid para predicción
-grid <- as.data.frame(dem, xy = TRUE, na.rm = TRUE)
-names(grid)[3] <- "altitud_dem"
-coordinates(grid) <- ~x+y
-proj4string(grid) <- crs(dem)
-
-# Realizar cokriging
-cokriging_result <- predict(vg_fit, newdata = grid)
-
-# Convertir resultado a raster
-df_co <- as.data.frame(cokriging_result)
-cokriging_raster <- rast(df_co[, c("x", "y", "prec.pred")], type = "xyz")
-crs(cokriging_raster) <- crs(dem)
-plot(cokriging_raster)
-
-crs(cokriging_raster)
-crs(eh)
-
-
-# Mask the cokriging result to the shape of Euskal Herria
-cokriging_crop <- crop(cokriging_raster, eh)
-cokriging_masked <- mask(cokriging_crop, eh)
-
-# Plotear el resultado del cokriging
-plot(cokriging_masked)
-lines(eh, col = "black")
-
-library(tidyverse)
-# Con ggplot
-cokriging_df <- as.data.frame(cokriging_masked, xy = TRUE, na.rm = TRUE) 
-
-p2 <- ggplot() +
-  geom_raster(data = cokriging_df, aes(x = x, y = y, fill = prec.pred)) +
-  geom_sf(data = herrialdeak, fill = NA, color = "black", lwd = 0.075) +
-  geom_sf(data = eh, fill = NA, color = "black", lwd = 0.6) +
-  scale_fill_gradientn(colors = cols, 
-                       breaks = breaks_vals, 
-                       limits = c(0, 300), 
-                       oob = scales::squish,
-                       name = "(mm)") +
-  labs(title = "Prezipitazioa Martxoan", subtitle = "Cokriging") +
-  theme_minimal() +
-  theme(legend.position = "bottom",
-        legend.key.width = unit(1.5, "cm"),
-        legend.key.height = unit(0.5, "cm"),
-        panel.grid = element_blank(),
-        axis.title = element_blank(),
-        axis.text = element_blank(),
-        axis.ticks = element_blank(),
-        plot.title = element_text(hjust = 0.5, size = 24, face = "bold", margin = margin(t = 10, b = 5)),
-        plot.subtitle = element_text(hjust = 0.5, size = 14, margin = margin(t = 0, b = 5))
-        ) 
-
-p2
-
-# Guardar el plot
-ggsave( 
-  filename = "cokriging_martxoa.png",         # nombre del archivo
-  plot = p2,                                  # plot a guardar
-  width = 8,                                  # ancho en pulgadas
-  height = 10,                                # alto en pulgadas
-  dpi = 300                                   # resolución (para imprimir/publicar)
-)
-
-# Guardar los dos plots juntos
-library(gridExtra)
-combined_plot <- grid.arrange(p, p2, ncol = 2)
-ggsave( 
-  filename = "kriging_cokriging_biak.png",         # nombre del archivo
-  plot = combined_plot,                                  # plot a guardar
-  width = 16,                                  # ancho en pulgadas
-  height = 10,                                # alto en pulgadas
-  dpi = 300                                   # resolución (para imprimir/publicar)
-)
 
 ############# KLIMATOLOGIA ETA ANOMALIA #####################
 library(terra)
@@ -359,12 +364,47 @@ p_klima <- ggplot() +
         axis.ticks = element_blank(),
         plot.title = element_text(hjust = 0.5, size = 24, face = "bold", margin = margin(t = 10, b = 5)),
         plot.subtitle = element_text(hjust = 0.5, size = 14, margin = margin(t = 0, b = 5))
-        )
+  )
 
 p_klima
 
-################### Cokriging 2 ###################
-# Realizar el mismo cokriging pero con las dimensiones de la climatología para poder comparar ambos mapas.
+################ Cokriging #########################
+library(terra)
+library(gstat)
+library(sf)
+library(sp)
+
+# cargar DEM de Euskal Herria
+dem <- rast("eh_dem.tif")
+ext(dem)
+crs(dem)
+plot(dem)
+
+# Excluir estaciones con datos faltantes
+data <- data %>% filter(!is.na(latitud) & !is.na(longitud) & !is.na(precipitacion_mes))
+
+# Crear un objeto sf con los datos de precipitación
+data_sf <- st_as_sf(data, coords = c("longitud", "latitud"), crs = 4326) 
+
+# Extraer altitud para cada estación de datos de precipitación
+coords <- vect(data_sf)
+data_sf$altitud_dem <- extract(dem, coords)[,2]
+data_clean <- data_sf %>% filter(!is.na(altitud_dem))
+
+# Convertir a SpatialPointsDataFrame para gstat
+data_sp <- as(data_clean, "Spatial")
+
+# Crear el model de cokriging usando la variable de precipitación y la altitud como covariable.
+g <- gstat(NULL, id = "prec", formula = precipitacion_mes ~ 1, data = data_sp)
+g <- gstat(g, id = "alt", formula = altitud_dem ~ 1, data = data_sp)
+
+# Variograma y ajuste
+vg <- variogram(g)
+
+vg_model <- vgm(1, "Sph", 10000, 0.1)
+vg_fit <- fit.lmc(vg, g, model = vg_model)
+
+# Crear grid para predicción
 new_grid <- as.data.frame(climatologia_masked, xy = TRUE, na.rm = TRUE)
 names(new_grid)[3] <- "altitud_dem"
 coordinates(new_grid) <- ~x+y
@@ -383,11 +423,19 @@ lines(eh, col = "black")
 # Plotear el resultado del cokriging con la nueva grid
 cokriging_df2 <- as.data.frame(cokriging_raster_2, xy = TRUE, na.rm = TRUE) 
 
+# Crear paleta de colores
+palette1 <- colorRampPalette(c("white", "#ffffd9", "#c8e9b4", "#41b6c4", 
+                              "#1b91c0", "#225ea8","#0d2c84", "#d100d1"))
+cols1 <- palette1(100)   # 100 colores
+
+# Define ranges for breaks
+breaks_vals <- seq(0, 300, by = 50)
+
 p3 <- ggplot() +
   geom_raster(data = cokriging_df2, aes(x = x, y = y, fill = prec.pred)) +
   geom_sf(data = herrialdeak, fill = NA, color = "black", lwd = 0.075) +
   geom_sf(data = eh, fill = NA, color = "black", lwd = 0.6) +
-  scale_fill_gradientn(colors = cols, 
+  scale_fill_gradientn(colors = cols1, 
                        breaks = breaks_vals, 
                        limits = c(0, 300), 
                        oob = scales::squish,
@@ -406,6 +454,17 @@ p3 <- ggplot() +
   ) 
 
 p3
+
+# Guardar el plot
+ggsave( 
+  filename = "cokriging_martxoa2.png",         # nombre del archivo
+  plot = p3,                                  # plot a guardar
+  width = 8,                                  # ancho en pulgadas
+  height = 10,                                # alto en pulgadas
+  dpi = 300                                   # resolución (para imprimir/publicar)
+)
+
+
 
 ################### Anomalia #####################
 library(scales)
@@ -447,9 +506,21 @@ p_anomalia
 
 # Guardar el plot de la anomalía
 ggsave( 
-  filename = "anomalia_martxoa.png",         # nombre del archivo
+  filename = "anomalia_martxoa2.png",         # nombre del archivo
   plot = p_anomalia,                                  # plot a guardar
   width = 8,                                  # ancho en pulgadas
+  height = 10,                                # alto en pulgadas
+  dpi = 300                                   # resolución (para imprimir/publicar)
+)
+
+# Guardar los dos plots juntos en un mismo archivo
+library(gridExtra)
+combined_plot <- grid.arrange(p3, p_anomalia, ncol = 2)
+
+ggsave(
+  filename = "pilatutakoa_eta_anomalia_martxoa.png", # nombre del archivo
+  plot = combined_plot,                       # plot a guardar
+  width = 16,                                # ancho en pulgadas
   height = 10,                                # alto en pulgadas
   dpi = 300                                   # resolución (para imprimir/publicar)
 )
